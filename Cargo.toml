@@ -1,0 +1,6 @@
+[package]
+name = "memcached"
+version = "0.1.0"
+authors = ["Ogier Bouvier <ars3nic@ars3nic.ch>"]
+
+[dependencies]
