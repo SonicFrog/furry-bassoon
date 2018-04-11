@@ -49,10 +49,12 @@ where
         (hasher.finish() as usize) % self.bucket_count
     }
 
+    #[inline]
     fn find_bucket_ro(&self, key: &K) -> RwLockReadGuard<Bucket<K, V>> {
         self.buckets[self.hash(key)].read().unwrap()
     }
 
+    #[inline]
     fn find_bucket_rw(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>>{
         self.buckets[self.hash(key)].write().unwrap()
     }

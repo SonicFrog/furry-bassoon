@@ -1,174 +1,233 @@
-use std::collections::hash_map::DefaultHasher;
-use std::cell::{Ref, RefCell};
-use std::hash::{Hash, Hasher};
-use std::rc::Rc;
-use std::sync::{RwLock, RwLockReadGuard};
-use std::ops::DerefMut;
+extern crate owning_ref;
+
+use std::collections::hash_map::RandomState;
+use std::hash::{Hash, BuildHasher, Hasher};
+use std::mem;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::ops::Deref;
 use std::vec::Vec;
 
-pub struct LoanMap<'a, K: 'a, V: 'a>
-    where K: Eq + Hash,
+use self::owning_ref::{OwningHandle, OwningRef};
+
+const DEFAULT_TABLE_CAPACITY: usize = 128;
+const DEFAULT_BUCKET_CAPACITY: usize = 128;
+
+enum Bucket<K, V>
 {
-    bucket_count: usize,
-    buckets: Vec<RwLock<InternalBucket<'a, K, V>>>,
+    Empty,
+    Contains(K, V),
 }
 
-impl<'a, K, V> LoanMap<'a, K, V>
-    where K: Eq + Hash,
+impl<K, V> Bucket<K, V>
 {
-    fn hash(&self, key: &K) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % self.bucket_count
-    }
-
-    pub fn new(count: usize, size: usize) -> LoanMap<'a, K, V> {
-        LoanMap{
-            bucket_count: count,
-            buckets: Vec::with_capacity(size),
+    fn is_free(&self) -> bool {
+        match *self {
+            Bucket::Empty => true,
+            _ => false,
         }
     }
 
-    pub fn get(&self, key: &K) -> Option<Rc<RwLockReadGuard<&'a V>>> {
-        let bucket = &self.buckets[self.hash(key)];
-
-        bucket.read().unwrap().entries
-            .iter()
-            .find(|entry| entry.key == key)
-            .map(|entry| entry.get())
-    }
-
-    pub fn put(&self, key: &'a K, val: &'a V) {
-        let mut guard = self.buckets[self.hash(key)].write().unwrap();
-        guard.deref_mut().insert(key, val);
-    }
-}
-
-struct InternalBucket<'a, K: 'a, V: 'a>
-    where K: Eq + Hash,
-{
-    entries: Vec<Rc<InternalEntry<'a, K, V>>>,
-}
-
-impl<'a, K, V> InternalBucket<'a, K, V>
-    where K: Eq + Hash,
-{
-    /// Get a value for some key in this bucket
-    #[inline]
-    fn get(&self, key: &K) -> Option<Rc<InternalEntry<'a, K, V>>> {
-        self.entries
-            .iter()
-            .find(|entry|
-                  *entry.key == *key
-            )
-            .map(|entry| Rc::clone(&entry))
-    }
-
-    /// Inserts a new key/value pair in this bucket
-    /// The key must hash to the index of this bucket in this map!
-    #[inline]
-    fn insert(&mut self, key: &'a K, val: &'a V) {
-        if self.contains(key) {
-            self.entries
-                .iter()
-                .find(|entry| {
-                *entry.key == *key
-            }).unwrap().replace(val);
+    fn value(self) -> Option<V> {
+        if let Bucket::Contains(_, v) = self {
+            Some(v)
         } else {
-            self.entries.push(
-                Rc::new(InternalEntry{
-                    key: key,
-                    value: RefCell::new(RwLock::new(val)),
-                })
-            );
+            None
         }
     }
 
-    fn clean(&mut self, key: &K) -> usize {
-        for i in 0..self.entries.len() {
-            let entry = self.entries[i];
-
-            if entry.key != key {
-                continue;
-            }
-
-            let lock = entry.try_write();
-
-            if entry.is_ok() {
-                self.entries.remove(i);
-            }
+    fn value_ref(&self) -> Result<&V, ()> {
+        if let Bucket::Contains(_, ref val) = *self {
+            Ok(val)
+        } else {
+            Err(())
         }
     }
 
-    /// Checks whether this bucket contains a given key
-    #[inline]
-    fn contains(&self, key: &'a K) -> bool {
-        self.entries
-            .iter()
-            .find(|entry| *entry.key == *key)
-            .is_some()
-    }
-
-    /// Removes all matching keys from this bucket
-    #[inline]
-    fn remove(&mut self, key: &'a K) {
-        for i in 0..self.entries.len() {
-            if self.entries[i].key == key {
-                self.entries.remove(i);
-            }
+    fn key_matches(&self, key: &K) -> bool
+        where K: PartialEq,
+    {
+        if let Bucket::Contains(ref ckey, _) = *self {
+            ckey == key
+        } else {
+            false
         }
     }
 }
 
-struct InternalEntry<'a, K: 'a, V: 'a>
-    where K: Eq + Hash,
+struct Table<K, V>
+    where K: PartialEq + Hash,
 {
-    key: &'a K,
-    value: RwLock<&'a V>,
+    hash_builder: RandomState,
+    buckets: Vec<RwLock<Bucket<K, V>>>,
 }
 
-impl <'a, K, V> InternalEntry<'a, K, V>
-    where K: Eq + Hash,
-          V: Sized,
+impl<K, V> Table<K, V>
+    where K: PartialEq + Hash,
 {
-    /// Returns a read locked reference counted pointer to this value
-    /// The lock is only released when all copies of this Rc are dropped
-    #[inline]
-    fn get(&self) -> Rc<RwLockReadGuard<&'a V>> {
-        Rc::new(self.value.read().unwrap())
+    fn with_capacity(cap: usize) -> Table<K, V> {
+        Table{
+            hash_builder: RandomState::new(),
+            buckets: (0..cap).map(|_| RwLock::new(Bucket::Empty)).collect(),
+        }
     }
 
-    /// Gets the entry out while keeping the lock locked inside the map
-    #[inline]
-    fn get_locked(&self) -> Rc<LockedMapEntry<'a, K, V>> {
-        Rc::new(LockedMapEntry {
-            key: self.key.clone(),
-            value: Rc::new(self.value.read().unwrap()),
+    fn hash(&self, key: &K) -> usize {
+        let mut hasher = self.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish() as usize
+    }
+
+    fn scan<F>(&self, key: &K, matches: F) -> RwLockReadGuard<Bucket<K, V>>
+        where F: Fn(&Bucket<K, V>) -> bool,
+    {
+        let hash = self.hash(key);
+        let lock = self.buckets[hash % self.buckets.len()].read().unwrap();
+
+        if matches(&lock) {
+            return lock;
+        }
+
+        unreachable!();
+    }
+
+    fn scan_mut<F>(&self, key: &K, matches: F) -> RwLockWriteGuard<Bucket<K, V>>
+        where F: Fn(&Bucket<K, V>) -> bool,
+    {
+        let hash = self.hash(key);
+        let lock = self.buckets[hash % self.buckets.len()].write().unwrap();
+
+        if matches(&lock) {
+            return lock;
+        }
+
+        unreachable!();
+    }
+
+    fn lookup(&self, key: &K) -> RwLockReadGuard<Bucket<K, V>> {
+        self.scan(key, |x| {
+            if let &Bucket::Contains(ref ckey, _) = x {
+                ckey == key
+            } else {
+                false
+            }
         })
     }
 
-    /// Replaces the value of this entry and returns the old one
-    #[inline]
-    fn replace(&self, new: &'a V) {
-        self.value.replace(RwLock::new(new));
+    fn lookup_or_free(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>> {
+        self.scan_mut(key, |x| {
+            if let &Bucket::Contains(ref ckey, _) = x {
+                true
+            } else {
+                x.is_free()
+            }
+        })
+    }
+
+    fn lookup_mut(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>> {
+        self.scan_mut(key, |x| {
+            if let &Bucket::Contains(ref ckey, _) = x {
+            ckey == key
+            } else {
+                false
+            }
+        })
+    }
+
+    fn lookup_free_bucket(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>> {
+        self.scan_mut(key, |x| x.is_free())
     }
 }
 
-/// Holds the guard that locks the actual entry inside the map
-pub struct LockedMapEntry<'a, K: 'a, V: 'a>
-    where K: Hash + Eq
-{
-    key: &'a K,
-    value: Rc<RwLockReadGuard<'a, &'a V>>,
+pub struct ReadGuard<'a, K: 'a + PartialEq + Hash, V: 'a> {
+    inner: OwningRef<OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>, V>,
 }
 
-impl<'a, K, V> Clone for LockedMapEntry<'a, K, V>
-    where K: Hash + Eq,
+impl<'a, K, V> Deref for ReadGuard<'a, K, V>
+    where K: PartialEq + Hash,
 {
-    fn clone(&self) -> Self {
-        LockedMapEntry{
-            key: self.key,
-            value: self.value.clone(),
+    type Target = V;
+
+    fn deref(&self) -> &V {
+        &self.inner
+    }
+}
+
+impl<'a, K, V: PartialEq> PartialEq for ReadGuard<'a, K, V>
+    where K: PartialEq + Hash,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl<'a, K, V: PartialEq> Eq for ReadGuard<'a, K, V>
+    where K: PartialEq + Hash, {}
+
+pub struct LoanMap<K, V>
+    where K: PartialEq + Hash,
+{
+    table: RwLock<Table<K, V>>,
+}
+
+impl<K, V> LoanMap<K, V>
+    where K: PartialEq + Hash,
+{
+    pub fn new() -> LoanMap<K, V> {
+        LoanMap {
+            table: RwLock::new(Table::with_capacity(DEFAULT_TABLE_CAPACITY)),
         }
+    }
+
+    pub fn with_capacity(cap: usize) -> LoanMap<K, V> {
+        LoanMap {
+            table: RwLock::new(Table::with_capacity(cap)),
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<ReadGuard<K, V>> {
+        if let Ok(inner) = OwningRef::new(
+            OwningHandle::new_with_fn(self.table.read().unwrap(),
+                                      |x| unsafe { &*x }.lookup(key)))
+            .try_map(|x| x.value_ref()) {
+                Some(ReadGuard{inner: inner})
+            } else {
+                None
+            }
+    }
+
+    pub fn put(&self, key: K, val: V) -> Option<V> {
+        let lock = self.table.read().unwrap();
+        let mut bucket = lock.lookup_mut(&key);
+
+        mem::replace(&mut *bucket, Bucket::Contains(key, val)).value()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoanMap;
+
+    #[test]
+    fn loan_map_insert_then_get() {
+        let map: LoanMap<String, String> = LoanMap::new();
+
+        let (key, value) = (String::from("i'm a key"), String::from("i'm a value"));
+
+        assert_eq!(map.put(key, value), None);
+        assert_eq!(map.get(&key).map(|x| x.deref()), Some(value));
+    }
+
+    #[test]
+    fn loan_map_double_insert_updates_value() {
+        let map: LoanMap<String, String> = LoanMap::new();
+
+        let key = String::from("i'm a key");
+        let value1 = String::from("i'm the first value");
+        let value2 = String::from("i'm the second value");
+
+        map.put(key, value1);
+        map.put(key, value2);
+
+        assert_eq!(map.get(&key).map(|x| x.deref()), Some(value2));
     }
 }
