@@ -1,3 +1,6 @@
+#![feature(test)]
+#![feature(integer_atomics)]
+
 mod map;
 mod loan_map;
 
@@ -18,7 +21,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    extern crate test;
     use map::ConcurrentHashMap;
+    use self::test::Bencher;
 
     const TEST_SET_SIZE: u32 = 4096;
 
@@ -29,16 +34,16 @@ mod tests {
         assert_eq!(map.get(&s), None);
     }
 
-    // #[bench]
-    // fn bench_access_32_32(b: &mut Bencher) {
-    //     let map: ConcurrentHashMap<String, u32> = ConcurrentHashMap::new(32, 32);
+    #[bench]
+    fn bench_access_32_32(b: &mut Bencher) {
+        let map: ConcurrentHashMap<String, u32> = ConcurrentHashMap::new(32, 32);
 
-    //     for i in 0..TEST_SET_SIZE {
-    //         map.insert(&i.to_string(), i);
-    //     }
+        for i in 0..TEST_SET_SIZE {
+            map.insert(&i.to_string(), i);
+        }
 
-    //     b.iter(|| for i in 0..TEST_SET_SIZE { map.get(i.to_string()) })
-    // }
+        b.iter(|| for i in 0..TEST_SET_SIZE { map.get(&(i.to_string())); })
+    }
 
     #[test]
     fn existing_key_returns_some_value() {
