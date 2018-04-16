@@ -5,7 +5,6 @@ mod map;
 mod loan_map;
 
 use self::map::ConcurrentHashMap;
-use self::loan_map::LoanMap;
 
 fn main() {
     let map: ConcurrentHashMap<u32, String> = ConcurrentHashMap::new(32, 32);

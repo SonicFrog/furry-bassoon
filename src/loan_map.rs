@@ -119,15 +119,6 @@ impl<K, V> Table<K, V>
         })
     }
 
-    #[inline]
-    fn match_free(bucket: &Bucket<K, V>) -> bool {
-        if let &Bucket::Contains(ref ckey, _) = bucket {
-            true
-        } else {
-            bucket.is_free()
-        }
-    }
-
     fn lookup_or_free(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>> {
         self.scan_mut(key, |x| {
             if let Bucket::Contains(ref ckey, _) = *x {
@@ -215,6 +206,8 @@ impl<K, V> LoanMap<K, V>
         }
     }
 
+    /// Allocates a new `LoanMap` with `cap` buckets
+    /// Take great care to allocate enough buckets since resizing the map is *very* costly
     pub fn with_capacity(cap: usize) -> LoanMap<K, V> {
         LoanMap {
             table: RwLock::new(Table::with_capacity(cap)),
@@ -232,6 +225,16 @@ impl<K, V> LoanMap<K, V>
             }
     }
 
+    pub fn upsert<F>(&self, key: K, f: F) -> Option<V>
+        where F: FnOnce(&V) -> V
+    {
+        let guard = self.table.read().unwrap();
+        let mut bucket = guard.lookup_mut(&key);
+        let new_val = f(bucket.value_ref().expect("can't upsert non existent keys"));
+
+        mem::replace(&mut *bucket, Bucket::Contains(key, new_val)).value()
+    }
+
     pub fn put(&self, key: K, val: V) -> Option<V> {
         let lock = self.table.read().unwrap();
         let mut bucket = lock.lookup_or_free_mut(&key);
@@ -239,9 +242,9 @@ impl<K, V> LoanMap<K, V>
         mem::replace(&mut *bucket, Bucket::Contains(key, val)).value()
     }
 
-    pub fn remove(&self, key: K) -> Option<V> {
+    pub fn remove(&self, key: &K) -> Option<V> {
         let lock = self.table.read().unwrap();
-        let mut bucket = lock.lookup_or_free_mut(&key);
+        let mut bucket = lock.lookup_or_free_mut(key);
 
         mem::replace(&mut *bucket, Bucket::Removed).value()
     }
@@ -254,9 +257,10 @@ mod tests {
     extern crate test;
     extern crate rand;
 
+    use std::iter;
     use std::sync::atomic::{AtomicI64, Ordering};
-    use std::thread;
 
+    use self::crossbeam_utils::scoped::{ScopedJoinHandle};
     use self::crossbeam_utils::scoped;
     use self::rand::distributions::Alphanumeric;
     use self::rand::Rng;
@@ -270,13 +274,15 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let keys: Vec<String> = (0..set_size).map(|_| {
-            rng.gen_ascii_chars()
+            iter::repeat(()).map(|()| rng.sample(Alphanumeric))
                 .take(key_size)
                 .collect::<String>()
         }).collect();
 
         for key in &keys {
-            map.put(key.clone(), rng.gen_ascii_chars().take(1024).collect::<String>());
+            map.put(key.clone(),
+                    iter::repeat(()).map(|()| rng.sample(Alphanumeric))
+                    .take(1024).collect::<String>());
         }
 
         (map, keys)
@@ -300,7 +306,7 @@ mod tests {
         let (key, value) = (String::from("key1"), String::from("value1"));
 
         assert_eq!(map.put(key.clone(), value.clone()), None);
-        assert_eq!(map.remove(key), Some(value));
+        assert_eq!(map.remove(&key), Some(value));
     }
 
     #[test]
@@ -311,135 +317,130 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_insert() {
-        let keys: Vec<String> = vec!["key1", "key2", "key3", "key4"]
-            .iter()
-            .map(|x| String::from(*x)).collect();
-        let map: LoanMap<String, u32> = LoanMap::with_capacity(8192);
-        let thread_num = 15;
-        const NUM_PUT: usize = 2048;
-        const NUM_GET: usize = 4096;
-        let guards : Vec<ScopedJoinHandle<()>> = Vec::new();
+    fn concurrent_upsert() {
+        let mut rng = rand::thread_rng();
+        let keys: Vec<String> = (0..8192)
+            .map(|_| iter::repeat(())
+                 .map(|()| rng.sample(Alphanumeric))
+                 .take(128)
+                 .collect::<String>())
+            .collect();
+        let map: LoanMap<String, u32> = LoanMap::with_capacity(keys.len() * 2);
+        const thread_num: i64 = 16;
+        const NUM_PUT: i64 = 8192 * 2;
+        const NUM_GET: i64 = 4 * NUM_PUT;
         let get_time = AtomicI64::new(0);
         let put_time = AtomicI64::new(0);
 
-        fn make_get_thread(scope: Scope, time_counter: &AtomicI64) {
-            guards.push(scope.spawn(|| {
-                for i in 0..NUM_PUT {
-                    let key = &keys[i % keys.len()];
-                    let start = time::now();
-
-                    {
-                        let guard = map.get(key).expect("missing key");
-                        map.put(*key, *guard + 1);
-                    } // let the thread do all map related ops and then calculate runtime
-
-                    put_time.fetch_add((time::now() - start).num_nanoseconds().expect("overflow!"),
-                                       Ordering::Relaxed);
-                }
-            }));
+        for i in &keys {
+            map.put(i.clone(), 0);
         }
 
-        // TODO: adapt this for crossbeam scopes
-        fn make_put_thread(scope: Scope, time_counter: &AtomicI64) {
-            guards.push(scope.spawn(|| {
-                for i in 0..NUM_GET {
-                    let key = &keys[i % keys.len()];
-                    let start = time::now();
+        scoped::scope(|s| {
+            let mut guards: Vec<ScopedJoinHandle<()>> = Vec::new();
+            s.defer(|| {
+                let computer = |x: &AtomicI64, c: i64| {
+                    x.load(Ordering::SeqCst) / (c * (thread_num / 2))
+                };
 
-                    {
-                        map.get(key).expect("missing key");
-                    }
+                let per_put = computer(&put_time, NUM_PUT);
+                let per_get = computer(&get_time, NUM_GET);
 
-                    get_time.fetch_add((time::now() -start).num_nanoseconds().expect("overflow!"),
-                                       Ordering::Relaxed);
+                println!("GET avg time: {}ns", per_get);
+                println!("PUT avg time: {}ns", per_put);
+
+                let mut total: u32 = 0;
+                for key in &keys {
+                    total += *map.get(key).expect("missing key");
                 }
-            }));
-        }
 
-        let scope = scoped::scope(|s| {
-            s.defer(println!("done running benchmark"));
+                assert_eq!(total, (thread_num / 2 * NUM_PUT) as u32);
+            });
+
             for i in 0..thread_num {
                 if i % 2 == 0 {
-                    // TODO: spawn get thread
+                    guards.push(s.spawn(|| {
+                        for i in 0..NUM_PUT {
+                            let key = keys[i as usize % keys.len()].clone();
+                            let mut start;
+
+                            {
+                                start = time::now();
+                                map.upsert(key, |x| { x + 1 });
+                            }
+
+                            put_time.fetch_add((time::now() - start)
+                                               .num_nanoseconds()
+                                               .expect("integer overflow"),
+                                               Ordering::SeqCst);
+                        }
+                    }));
                 } else {
-                    // TODO: spawn put thread
-                }
-                s.spawn(|| {
-                });
+                    guards.push(s.spawn(|| {
+                        for i in 0..NUM_GET {
+                            let key = &keys[i as usize % keys.len()];
+                            let start = time::now();
 
-                for i in &keys {
-                    map.put(*i, 0);
-                }
+                            {
+                                let _guard = map.get(key).expect("missing key");
+                            }
 
-                let put_guard = scope.scoped();
-
-                let get_guards = (0..thread_num - 1).map(|_| {
-                    scope.scoped(|| {
-                        let mut rng = rand::thread_rng();
-                        let key = &keys[rng.gen::<usize>() % keys.len()];
-                        let now = time::now();
-                        assert_eq!(map.get(key).is_some(), true);
-                    })
-                });
-
-                for g in get_guards {
-                    g.join();
+                            get_time.fetch_add((time::now() - start)
+                                               .num_nanoseconds()
+                                               .expect("overflow"),
+                                               Ordering::SeqCst);
+                        }
+                    }));
                 }
 
-                // compute time per get/put
-                let per_put = put_time.load(Ordering::Relaxed) / NUM_PUT as i64;
-                let per_get = get_time.load(Ordering::Relaxed) / (NUM_GET * (thread_num - 1)) as i64;
-
-                println!("GET time: {}ns", per_get);
-                println!("PUT time: {}ns", per_put);
             }
+            assert_eq!(false, true);
+        });
+    }
 
-            #[test]
-            fn double_insert_updates_value() {
-                let map: LoanMap<String, String> = LoanMap::new();
+    #[test]
+    fn double_insert_updates_value() {
+        let map: LoanMap<String, String> = LoanMap::new();
 
-                let key = String::from("i'm a key");
-                let value1 = String::from("i'm the first value");
-                let value2 = String::from("i'm the second value");
+        let key = String::from("i'm a key");
+        let value1 = String::from("i'm the first value");
+        let value2 = String::from("i'm the second value");
 
-                map.put(key.clone(), value1);
-                map.put(key.clone(), value2.clone());
+        map.put(key.clone(), value1);
+        map.put(key.clone(), value2.clone());
 
-                let from_map = map.get(&key).expect("map does not insert");
+        let from_map = map.get(&key).expect("map does not insert");
 
-                assert_eq!(*from_map, value2);
-            }
+        assert_eq!(*from_map, value2);
+    }
 
-            #[bench]
-            fn bench_access_string_key_string_value(b: &mut Bencher) {
-                let mut rng = rand::thread_rng();
-                let key_size = 128;
-                let set_size = 8192;
-                let (map, keys) = gen_rand_map(8192, 128);
+    #[bench]
+    fn bench_access_string_key_string_value(b: &mut Bencher) {
+        let mut rng = rand::thread_rng();
+        let set_size = 8192;
+        let (map, keys) = gen_rand_map(8192, 128);
 
-                b.iter(|| {
-                    let key = &keys[rng.gen::<usize>() % set_size];
+        b.iter(|| {
+            let key = &keys[rng.gen::<usize>() % set_size];
 
-                    assert_eq!(map.get(key).is_some(), true);
-                })
-            }
+            assert_eq!(map.get(key).is_some(), true);
+        })
+    }
 
-            #[bench]
-            fn bench_access_u32_key_u32_value(b: &mut Bencher) {
-                let mut rng = rand::thread_rng();
-                let ksize: usize = 128;
-                let ssize: usize = 8192;
-                let keys: Vec<u32> = (0..ssize).map(|_| rng.gen::<u32>()).collect();
-                let map: LoanMap<u32, u32> = LoanMap::with_capacity(2 * ssize);
+    #[bench]
+    fn bench_access_u32_key_u32_value(b: &mut Bencher) {
+        let mut rng = rand::thread_rng();
+        let ssize: usize = 8192;
+        let keys: Vec<u32> = (0..ssize).map(|_| rng.gen::<u32>()).collect();
+        let map: LoanMap<u32, u32> = LoanMap::with_capacity(2 * ssize);
 
-                for key in &keys {
-                    map.put(*key, rng.gen::<u32>());
-                }
-
-                b.iter(|| {
-                    let key = &keys[rng.gen::<usize>() % ssize];
-                    assert_eq!(map.get(key).is_some(), true);
-                })
-            }
+        for key in &keys {
+            map.put(*key, rng.gen::<u32>());
         }
+
+        b.iter(|| {
+            let key = &keys[rng.gen::<usize>() % ssize];
+            assert_eq!(map.get(key).is_some(), true);
+        })
+    }
+}
