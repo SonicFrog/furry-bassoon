@@ -4,6 +4,7 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{Hash, BuildHasher, Hasher};
 use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::Deref;
 use std::vec::Vec;
@@ -13,6 +14,129 @@ use self::owning_ref::{OwningHandle, OwningRef};
 const DEFAULT_TABLE_CAPACITY: usize = 128;
 const DEFAULT_BUCKET_CAPACITY: usize = 128;
 
+struct VersionTable<K, V> {
+    head: AtomicUsize,
+    bucket: Vec<RwLock<Bucket<K, V>>>,
+}
+
+impl<K, V> VersionTable<K, V>
+    where K: PartialEq
+{
+    fn new() -> VersionTable<K, V> {
+        VersionTable {
+            head: AtomicUsize::new(0),
+            bucket: (0..128).map(|_| RwLock::new(Bucket::Empty)).collect(),
+        }
+    }
+
+    fn with_capacity(cap: usize) -> VersionTable<K, V> {
+        VersionTable {
+            head: AtomicUsize::new(0),
+            bucket: (0..cap).map(|_| RwLock::new(Bucket::Empty)).collect(),
+        }
+    }
+
+    #[inline]
+    fn current_head(&self) -> usize {
+        self.head.load(Ordering::Relaxed) % self.bucket.len()
+    }
+
+    #[inline]
+    fn next_head(&self) -> usize {
+        self.head.fetch_add(1, Ordering::Relaxed) % self.bucket.len()
+    }
+
+    fn scan<F>(&self, f: F) -> RwLockReadGuard<Bucket<K, V>>
+        where F: Fn(&Bucket<K, V>) -> bool
+    {
+        let start = self.current_head();
+
+        for i in (0..start).rev() {
+            let bucket = self.bucket[i].read().unwrap();
+
+            if f(&bucket) {
+                return bucket;
+            }
+        }
+
+        for i in (start..self.bucket.len()).rev() {
+            let bucket = self.bucket[i].read().unwrap();
+
+            if f(&bucket) {
+                return bucket;
+            }
+        }
+
+        self.bucket[start].read().unwrap()
+    }
+
+    fn remove(&self, key: &K) -> Option<V> {
+        let idx = self.next_head();
+        let mut lock = self.bucket[idx].write().unwrap();
+
+        mem::replace(&mut *lock, Bucket::Removed).value()
+    }
+
+    fn scan_mut<F>(&self, f: F) -> RwLockWriteGuard<Bucket<K, V>>
+        where F: Fn(&mut Bucket<K, V>) -> bool
+    {
+        let start = self.current_head();
+
+        for i in (0..start).rev() {
+            if let Ok(mut guard) = self.bucket[i].try_write() {
+                if f(&mut guard) {
+                    return guard;
+                }
+            }
+        }
+
+        for i in (start..self.bucket.len()).rev() {
+            if let Ok(mut guard) = self.bucket[i].try_write() {
+                if f(&mut guard) {
+                    return guard;
+                }
+            }
+        }
+
+        self.bucket[start].write().unwrap()
+    }
+
+    fn update(&self, key: K, value: V) -> Option<V> {
+        let idx = self.next_head();
+        let mut bucket = self.bucket[idx].write().unwrap();
+
+        mem::replace(&mut *bucket, Bucket::Contains(key, value)).value()
+    }
+
+    fn newest(&self, key: &K) -> Option<RwLockReadGuard<Bucket<K, V>>> {
+        let start = self.current_head();
+
+        for i in (0..start).rev() {
+            let lock = self.bucket[i].read().unwrap();
+
+            if lock.key_matches(key) {
+                return Some(lock);
+            }
+        }
+
+        for i in (start..self.bucket.len()).rev() {
+            let lock = self.bucket[i].read().unwrap();
+            if lock.key_matches(key) {
+                return Some(lock);
+            }
+        }
+
+        None
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for VersionTable<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "VersionTable {{ len: {} }}", self.bucket.len())
+    }
+}
+
+#[derive(Debug)]
 enum Bucket<K, V>
 {
     Empty,
@@ -200,6 +324,7 @@ pub struct LoanMap<K, V>
 impl<K, V> LoanMap<K, V>
     where K: PartialEq + Hash,
 {
+    /// Allocates a new `LoanMap` with the default number of buckets
     pub fn new() -> LoanMap<K, V> {
         LoanMap {
             table: RwLock::new(Table::with_capacity(DEFAULT_TABLE_CAPACITY)),
@@ -267,6 +392,7 @@ mod tests {
     use self::test::Bencher;
 
     use super::LoanMap;
+    use super::VersionTable;
 
     /// Generates a random map with `set_size` elements and keys of size `key_size`
     fn gen_rand_map(set_size: usize, key_size: usize) -> (LoanMap<String, String>, Vec<String>) {
@@ -286,6 +412,18 @@ mod tests {
         }
 
         (map, keys)
+    }
+
+    /// Generates a vector of random strings
+    fn gen_rand_strings(size: usize) -> Vec<String> {
+        let mut rng = rand::thread_rng();
+
+        (0..size).map(|_| {
+            iter::repeat(())
+                .map(|()| rng.sample(Alphanumeric))
+                .take(128)
+                .collect::<String>()
+        }).collect()
     }
 
     #[test]
@@ -394,6 +532,7 @@ mod tests {
                 }
 
             }
+            // the test has to fail for cargo to produce any output...
             assert_eq!(false, true);
         });
     }
@@ -414,11 +553,122 @@ mod tests {
         assert_eq!(*from_map, value2);
     }
 
+    #[test]
+    fn delete_value() {
+        let map: LoanMap<String, String> = LoanMap::new();
+        let key = String::from("key1");
+        let value = String::from("value");
+
+        map.put(key.clone(), value);
+        map.remove(&key);
+
+        assert_eq!(map.get(&key), None);
+    }
+
+    #[test]
+    fn version_table_values_dont_interfere() {
+        let table: VersionTable<String, String> = VersionTable::new();
+        let mut rng = rand::thread_rng();
+        let keys: Vec<String> = (0..10).map(|_| {
+            iter::repeat(())
+                .map(|()| rng.sample(Alphanumeric))
+                .take(128)
+                .collect::<String>()
+        }).collect();
+
+        let values: Vec<String> = keys.iter().map(|_| iter::repeat(())
+                                                  .map(|()| rng.sample(Alphanumeric))
+                                                  .take(128).collect::<String>()).collect();
+
+        for i in 0..keys.len() {
+            table.update(keys[i].clone(), values[i].clone());
+        }
+
+        for i in 0..keys.len() {
+            assert_eq!(table.newest(&keys[i]).expect("failed to insert key").value_ref(),
+                       Ok(&values[i]));
+        }
+    }
+
+    #[test]
+    fn version_table_multi_version_multi_key() {
+        let size = 256;
+        let table: VersionTable<String, String> = VersionTable::with_capacity(size);
+        let keys = gen_rand_strings(size);
+        let values = gen_rand_strings(2 * size);
+
+        // insert first set of values
+        for (key, value) in keys.iter().zip(values.iter()).take(size) {
+            table.update(key.clone(), value.clone());
+        }
+
+        // second round
+        for (key, value) in keys.iter().zip(values.iter().skip(size)) {
+            table.update(key.clone(), value.clone());
+            let opt = table.newest(&key);
+            assert_eq!(opt.expect("failed to insert key").value_ref(),
+                       Ok(value));
+        }
+    }
+
+    #[test]
+    fn version_table_overflow_overwrites_old_values() {
+        let size = 128;
+        let keys = gen_rand_strings(size * 2);
+        let values = gen_rand_strings(size * 2);
+        let table: VersionTable<String, String> = VersionTable::with_capacity(size);
+
+        let kv1: Vec<(String, String)> = gen_rand_strings(size)
+            .iter()
+            .map(|x| String::from(x.clone()))
+            .zip(gen_rand_strings(size))
+            .collect();
+        let kv2: Vec<(String, String)> = gen_rand_strings(size)
+            .iter()
+            .map(|x| String::from(x.clone()))
+            .zip(gen_rand_strings(size))
+            .collect();
+
+        assert_eq!(kv1.len(), kv2.len());
+
+        for kvset in vec![&kv1, &kv2] {
+            for &(ref key, ref value) in kvset {
+                table.update(key.clone(), value.clone());
+            }
+        }
+
+        // the first round of key should not be in the table anymore
+        for (key, value) in kv1 {
+            assert_eq!(table.newest(&key).is_none(), true);
+        }
+
+        for (key, value) in kv2 {
+            assert_eq!(table.newest(&key).expect("key missing").value_ref(), Ok(&value));
+        }
+    }
+
+    #[test]
+    fn version_table_update_single_key() {
+        let test_size = 512;
+        let table: VersionTable<String, String> = VersionTable::new();
+        let mut rng = rand::thread_rng();
+        let key = iter::repeat(()).map(|_| rng.sample(Alphanumeric))
+            .take(128)
+            .collect::<String>();
+        let values = gen_rand_strings(test_size);
+
+        for value in &values {
+            table.update(key.clone(), value.clone());
+            assert_eq!(table.newest(&key).expect("missing key").value_ref(),
+                       Ok(value));
+        }
+    }
+
     #[bench]
     fn bench_access_string_key_string_value(b: &mut Bencher) {
         let mut rng = rand::thread_rng();
         let set_size = 8192;
-        let (map, keys) = gen_rand_map(8192, 128);
+        let (map, keys) = gen_rand_map(8192 * 2, 128);
 
         b.iter(|| {
             let key = &keys[rng.gen::<usize>() % set_size];
