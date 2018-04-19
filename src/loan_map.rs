@@ -36,12 +36,10 @@ impl<K, V> VersionTable<K, V>
         }
     }
 
-    #[inline]
     fn current_head(&self) -> usize {
         self.head.load(Ordering::Relaxed) % self.bucket.len()
     }
 
-    #[inline]
     fn next_head(&self) -> usize {
         self.head.fetch_add(1, Ordering::Relaxed) % self.bucket.len()
     }
@@ -51,16 +49,9 @@ impl<K, V> VersionTable<K, V>
     {
         let start = self.current_head();
 
-        for i in (0..start).rev() {
-            let bucket = self.bucket[i].read().unwrap();
-
-            if f(&bucket) {
-                return bucket;
-            }
-        }
-
-        for i in (start..self.bucket.len()).rev() {
-            let bucket = self.bucket[i].read().unwrap();
+        for i in (0..self.bucket.len()).rev() {
+            let idx = (i + start) % self.bucket.len();
+            let bucket = self.bucket[idx].read().unwrap();
 
             if f(&bucket) {
                 return bucket;
@@ -70,11 +61,13 @@ impl<K, V> VersionTable<K, V>
         self.bucket[start].read().unwrap()
     }
 
-    fn remove(&self, key: &K) -> Option<V> {
-        let idx = self.next_head();
-        let mut lock = self.bucket[idx].write().unwrap();
-
-        mem::replace(&mut *lock, Bucket::Removed).value()
+    fn remove(&self, key: &K) {
+        self.scan_mut(|x| {
+            if x.key_matches(key) {
+                mem::replace(x, Bucket::Removed);
+            }
+            false
+        });
     }
 
     fn scan_mut<F>(&self, f: F) -> RwLockWriteGuard<Bucket<K, V>>
@@ -82,16 +75,9 @@ impl<K, V> VersionTable<K, V>
     {
         let start = self.current_head();
 
-        for i in (0..start).rev() {
-            if let Ok(mut guard) = self.bucket[i].try_write() {
-                if f(&mut guard) {
-                    return guard;
-                }
-            }
-        }
-
-        for i in (start..self.bucket.len()).rev() {
-            if let Ok(mut guard) = self.bucket[i].try_write() {
+        for i in (0..self.bucket.len()).rev() {
+            let idx = (i + start) % self.bucket.len();
+            if let Ok(mut guard) = self.bucket[idx].try_write() {
                 if f(&mut guard) {
                     return guard;
                 }
@@ -109,24 +95,18 @@ impl<K, V> VersionTable<K, V>
     }
 
     fn newest(&self, key: &K) -> Option<RwLockReadGuard<Bucket<K, V>>> {
-        let start = self.current_head();
-
-        for i in (0..start).rev() {
-            let lock = self.bucket[i].read().unwrap();
-
-            if lock.key_matches(key) {
-                return Some(lock);
+        let bucket = self.scan(|x| {
+            match *x {
+                Bucket::Contains(ref ckey, _) if ckey == key => true,
+                _ => false,
             }
-        }
+        });
 
-        for i in (start..self.bucket.len()).rev() {
-            let lock = self.bucket[i].read().unwrap();
-            if lock.key_matches(key) {
-                return Some(lock);
-            }
+        if bucket.key_matches(key) {
+            Some(bucket)
+        } else {
+            None
         }
-
-        None
     }
 }
 
@@ -197,12 +177,14 @@ impl<K, V> Table<K, V>
         }
     }
 
+    #[inline]
     fn hash(&self, key: &K) -> usize {
         let mut hasher = self.hash_builder.build_hasher();
         key.hash(&mut hasher);
         hasher.finish() as usize
     }
 
+    #[inline]
     fn scan<F>(&self, key: &K, matches: F) -> RwLockReadGuard<Bucket<K, V>>
         where F: Fn(&Bucket<K, V>) -> bool,
     {
@@ -216,7 +198,7 @@ impl<K, V> Table<K, V>
             }
         }
 
-        unreachable!();
+        panic!("out of memory");
     }
 
     fn scan_mut<F>(&self, key: &K, matches: F) -> RwLockWriteGuard<Bucket<K, V>>
@@ -232,7 +214,7 @@ impl<K, V> Table<K, V>
             }
         }
 
-        unreachable!();
+        panic!("out of memory");
     }
 
     fn lookup(&self, key: &K) -> RwLockReadGuard<Bucket<K, V>> {
@@ -355,7 +337,10 @@ impl<K, V> LoanMap<K, V>
     {
         let guard = self.table.read().unwrap();
         let mut bucket = guard.lookup_mut(&key);
-        let new_val = f(bucket.value_ref().expect("can't upsert non existent keys"));
+        let new_val = {
+            let value = bucket.value_ref().expect("key not found");
+            f(value)
+        };
 
         mem::replace(&mut *bucket, Bucket::Contains(key, new_val)).value()
     }
@@ -415,13 +400,13 @@ mod tests {
     }
 
     /// Generates a vector of random strings
-    fn gen_rand_strings(size: usize) -> Vec<String> {
+    fn gen_rand_strings(size: usize, esize: usize) -> Vec<String> {
         let mut rng = rand::thread_rng();
 
         (0..size).map(|_| {
             iter::repeat(())
                 .map(|()| rng.sample(Alphanumeric))
-                .take(128)
+                .take(esize)
                 .collect::<String>()
         }).collect()
     }
@@ -537,6 +522,27 @@ mod tests {
         });
     }
 
+    #[bench]
+    fn bench_huge_values(b: &mut Bencher) {
+        let set_size = 512;
+        let item_size = 4096;
+        let values = gen_rand_strings(set_size, item_size);
+        let keys = gen_rand_strings(set_size, item_size / 4);
+        let map: LoanMap<String, String> = LoanMap::with_capacity(set_size * 2);
+        let mut i = 0;
+
+        keys.iter().zip(values.iter()).for_each(|(k, v)| {
+            map.put(k.clone(), v.clone());
+        });
+
+        b.iter(move || {
+            let idx = i % set_size;
+            assert_eq!(*map.get(&keys[idx]).expect("missing key"),
+                       values[idx]);
+            i += 1;
+        })
+    }
+
     #[test]
     fn double_insert_updates_value() {
         let map: LoanMap<String, String> = LoanMap::new();
@@ -594,8 +600,8 @@ mod tests {
     fn version_table_multi_version_multi_key() {
         let size = 256;
         let table: VersionTable<String, String> = VersionTable::with_capacity(size);
-        let keys = gen_rand_strings(size);
-        let values = gen_rand_strings(2 * size);
+        let keys = gen_rand_strings(size, size);
+        let values = gen_rand_strings(2 * size, size);
 
         // insert first set of values
         for (key, value) in keys.iter().zip(values.iter()).take(size) {
@@ -614,19 +620,19 @@ mod tests {
     #[test]
     fn version_table_overflow_overwrites_old_values() {
         let size = 128;
-        let keys = gen_rand_strings(size * 2);
-        let values = gen_rand_strings(size * 2);
+        let keys = gen_rand_strings(size * 2, size);
+        let values = gen_rand_strings(size * 2, size);
         let table: VersionTable<String, String> = VersionTable::with_capacity(size);
 
-        let kv1: Vec<(String, String)> = gen_rand_strings(size)
+        let kv1: Vec<(String, String)> = gen_rand_strings(size, 128)
             .iter()
             .map(|x| String::from(x.clone()))
-            .zip(gen_rand_strings(size))
+            .zip(gen_rand_strings(size, 128))
             .collect();
-        let kv2: Vec<(String, String)> = gen_rand_strings(size)
+        let kv2: Vec<(String, String)> = gen_rand_strings(size, 128)
             .iter()
             .map(|x| String::from(x.clone()))
-            .zip(gen_rand_strings(size))
+            .zip(gen_rand_strings(size, 128))
             .collect();
 
         assert_eq!(kv1.len(), kv2.len());
@@ -655,7 +661,7 @@ mod tests {
         let key = iter::repeat(()).map(|_| rng.sample(Alphanumeric))
             .take(128)
             .collect::<String>();
-        let values = gen_rand_strings(test_size);
+        let values = gen_rand_strings(test_size, 128);
 
         for value in &values {
             table.update(key.clone(), value.clone());
